@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """deepseek-tokenizer 封装层。
 
-只依赖本地 ``.venv`` 中预装的 ``deepseek-tokenizer==0.3.0``，不引入任何第三方依赖。
+只依赖 ``deepseek-tokenizer``（开发与实测所用版本为 0.3.0），除此之外不引入
+其他第三方依赖；如未安装，导入时会抛出带安装指引的异常。
 
 封装要点：
 * 统一 ``encode`` / ``decode`` 入口，屏蔽 ``DeepSeekTokenizer`` 与 ``PurePythonTokenizer``
@@ -158,11 +159,11 @@ class TokenizerHandle:
 def _load_default():
     """加载包内置的 tokenizer；失败时抛出带指引的异常。"""
     try:
-        from deepseek_tokenizer import ds_token  # noqa: WPS433 (本地 .venv 内依赖)
+        from deepseek_tokenizer import ds_token  # noqa: WPS433 (运行时依赖)
     except ImportError as exc:  # pragma: no cover - 环境缺失时
         raise RuntimeError(
-            "未找到 deepseek-tokenizer。请在项目虚拟环境中安装：\n"
-            "    .venv\\Scripts\\python.exe -m pip install deepseek-tokenizer"
+            "未找到 deepseek-tokenizer。请先安装：\n"
+            "    python -m pip install deepseek-tokenizer"
         ) from exc
     return ds_token
 

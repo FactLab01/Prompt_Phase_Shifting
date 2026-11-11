@@ -5,15 +5,19 @@ from __future__ import annotations
 
 import unittest
 
+from phase_shifting.constants import DEFAULT_SLICE_LENGTH
 from phase_shifting.tokenizer_api import get_tokenizer
 from phase_shifting.validator import DynamicValidator
+
+PERIOD = DEFAULT_SLICE_LENGTH
+ZWSP = "​"
 
 
 class LocateAnchorTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tk = get_tokenizer()
-        cls.val = DynamicValidator(cls.tk, period=4)
+        cls.val = DynamicValidator(cls.tk, period=PERIOD)
 
     def test_locate_simple(self):
         text = "Hello world 关键信息"
@@ -62,19 +66,27 @@ class ValidateTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tk = get_tokenizer()
-        cls.val = DynamicValidator(cls.tk, period=4)
+        cls.val = DynamicValidator(cls.tk, period=PERIOD)
 
     def test_validate_aligned(self):
-        # 插入 4 个 ZWSP = 4 token，Hello 从 0 → 4，4 % 4 == 0 → 对齐
+        # 插入 PERIOD 个 ZWSP = PERIOD 个 token，Hello 从 0 → PERIOD，
+        # PERIOD % PERIOD == 0 → 对齐
+        filler = ZWSP * PERIOD
         before = "Hello world"
-        after = "​​​​Hello world"
+        after = filler + before
         ids = self.tk.encode(before)
         anchor = [ids[0]]
-        res = self.val.validate(before, after, anchor, expected_index=4, expected_inserted_tokens=4)
+        res = self.val.validate(
+            before,
+            after,
+            anchor,
+            expected_index=PERIOD,
+            expected_inserted_tokens=PERIOD,
+        )
         self.assertTrue(res.ok, res.reason)
         self.assertTrue(res.aligned)
-        self.assertEqual(res.new_index, 4)
-        self.assertEqual(res.inserted_tokens, 4)
+        self.assertEqual(res.new_index, PERIOD)
+        self.assertEqual(res.inserted_tokens, PERIOD)
 
     def test_validate_not_aligned(self):
         before = "Hello world"
@@ -116,9 +128,11 @@ class ValidateTest(unittest.TestCase):
 
     def test_is_aligned_and_phase(self):
         self.assertTrue(self.val.is_aligned(0))
-        self.assertTrue(self.val.is_aligned(4))
+        self.assertTrue(self.val.is_aligned(PERIOD))
+        self.assertTrue(self.val.is_aligned(PERIOD * 3))
         self.assertFalse(self.val.is_aligned(1))
-        self.assertEqual(self.val.phase(5), 1)
+        self.assertEqual(self.val.phase(PERIOD + 1), 1)
+        self.assertEqual(self.val.phase(0), 0)
 
 
 if __name__ == "__main__":

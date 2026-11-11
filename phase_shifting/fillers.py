@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """无害占位符注册表。
 
-设计约束（全部由探针实验在 ``.venv`` 内实测得出，见 ``docs/SPEC.md`` 第 3 节）：
+设计约束（全部由探针实验实测得出，见 ``docs/SPEC.md`` 第 3 节）：
 
 * 每个字符必须能被 deepseek-tokenizer **稳定编码**，且 **1 个字符 = N 个 token** 的关系
   在重复时保持线性（不合并、不拆分）；
@@ -15,12 +15,12 @@
 ===== ======= ============= =========================
 zwsp  U+200B  1             零宽空格，首选
 bom   U+FEFF  1             零宽不换行空格，备选
-mix   U+200B+ 1             zwsp/bom 交替，防单一字符被过滤
-wj    U+2060  2             word joiner，粒度 2，兜底
-lf    U+000A  1             换行，会改变段落结构，最后兜底
+mix   U+200B+ 1             zwsp/bom 交替混合
+wj    U+2060  2             word joiner，粒度 2，末位候选
+lf    U+000A  1             换行，会改变段落结构，末位候选
 ===== ======= ============= =========================
 
-``register()`` 会在运行时实测每个候选的 token 成本，成本与声明不符的候选会被自动降级，
+构造注册表时会实测每个候选的 token 成本，与声明不符的按实测值校正，
 保证"算法以为插了 1 个 token"与"实际真的是 1 个 token"一致。
 """
 
@@ -30,6 +30,7 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from .errors import UnknownFillerError
 from .tokenizer_api import TokenizerHandle, codepoint_str, describe_char
 
 log = logging.getLogger("phase_shifting.fillers")
@@ -39,11 +40,17 @@ log = logging.getLogger("phase_shifting.fillers")
 class FillerSpec:
     """一个占位符候选的完整描述。"""
 
+    #: 候选名称，用于 ``filler_priority`` 与报告。
     name: str
+    #: 占位字符本身。
     char: str
-    declared_cost: int  # 每个字符对应的 token 数（实测后校正）
-    invisible: bool  # 是否不可见
-    structural: bool  # 是否会改变段落结构（True = 有干扰）
+    #: 每个字符对应的 token 数（注册表构造时按实测值校正）。
+    declared_cost: int
+    #: 是否不可见。
+    invisible: bool
+    #: 是否会改变段落结构（``True`` 表示有干扰，不参与还原剥离）。
+    structural: bool
+    #: 人类可读备注。
     note: str = ""
 
     @property
@@ -101,24 +108,37 @@ class FillerRegistry:
         return list(self._order)
 
     def get(self, name: str) -> FillerSpec:
+        """按名称取占位符规格。
+
+        Args:
+            name: 候选名称。
+
+        Returns:
+            对应的 :class:`FillerSpec`。
+
+        Raises:
+            UnknownFillerError: 名称不存在（该异常同时是 ``KeyError``）。
+        """
         if name not in self._specs:
-            raise KeyError("未知占位符：%s（可用：%s）" % (name, ", ".join(self._order)))
+            raise UnknownFillerError(name, self._order)
         return self._specs[name]
 
     def primary(self) -> FillerSpec:
-        """首选的不可见、无结构干扰、成本为 1 的占位符。"""
+        """首选的不可见、无结构干扰、成本为 1 的占位符。
+
+        没有完全满足条件的候选时，依次退到"第一个不可见候选"与"第一个候选"。
+        """
         for name in self._order:
             spec = self._specs[name]
             if spec.invisible and not spec.structural and spec.declared_cost == 1:
                 return spec
-        # 退化：返回第一个不可见的
         for name in self._order:
             if self._specs[name].invisible:
                 return self._specs[name]
         return self._specs[self._order[0]]
 
     def fallback_chain(self, exclude: Optional[str] = None) -> List[FillerSpec]:
-        """重试时使用的占位符链（排除刚失败的那个）。"""
+        """按优先级列出候选链；``exclude`` 命中的候选被跳过。"""
         chain = []
         for name in self._order:
             if name == exclude:

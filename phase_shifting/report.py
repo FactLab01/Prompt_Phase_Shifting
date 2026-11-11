@@ -83,7 +83,7 @@ def _map_positions(report, after_ids: List[int]) -> Dict[int, int]:
                 found = j
                 break
         if found < 0:
-            # 极端情况（BPE 边界变化导致 id 消失）：退化为等距位移
+            # BPE 边界变化导致 id 消失：按等距位移给出可用下标
             mapping[d.index] = min(pos, len(after_ids) - 1)
             continue
         mapping[d.index] = found
@@ -97,7 +97,7 @@ def render_text(outcome: AlignOutcome, tokenizer: TokenizerHandle, verbose: bool
     bar = "=" * 72
 
     lines.append(bar)
-    lines.append("前置相位偏移报告  |  period=%d  |  虚拟环境: .venv" % outcome.period)
+    lines.append("前置相位偏移报告  |  slice_length=%d" % outcome.period)
     lines.append(bar)
 
     lines.append("【输入规模】")

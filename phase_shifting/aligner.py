@@ -14,9 +14,8 @@
         → 失败：换插入点 / 换数量 / 换占位种类，重试 ≤ max_retries
 
 设计约束（插入点必须紧贴目标 token）：
-  插入点若落在目标 token 所属段落的头部，会推动该段落内**所有** token 的
-  下标，导致"修好一个、推歪另一个"的级联抖动，无法保证收敛。
-  因此插入点必须紧贴目标 token，并以"前缀零破坏"作为硬性验收条件。
+  插入点只允许落在目标 token 的正前方，并以"前缀零破坏"作为硬性验收条件，
+  使已对齐 token 的相位永不受扰动，迭代因此必然收敛。
 
 关键点：
 
@@ -33,6 +32,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from .constants import (
+    DEFAULT_MAX_CHARS,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_SLICE_LENGTH,
+)
+from .errors import InputError
 from .fillers import FillerRegistry, FillerSpec
 from .keytokens import KeyTokenReport, KeyTokenSelector
 from .segments import (
@@ -47,14 +52,24 @@ from .validator import DynamicValidator, ValidationResult
 
 log = logging.getLogger("phase_shifting.aligner")
 
-INSERT_MODE_SEGMENT = "segment"  # 段落头部（兼容旧行为，默认关闭）
+INSERT_MODE_SEGMENT = "segment"  # 段落头部
 INSERT_MODE_INLINE = "inline"  # token 正前方（默认）
 INSERT_MODES = (INSERT_MODE_SEGMENT, INSERT_MODE_INLINE)
 
 #: 插入点相对 token 起始偏移的候选（0 = 紧贴 token）
 _OFFSET_CANDIDATES = (0, -1, 1, -2, 2, -3, 3)
-#: 占位字符数量的候选倍数（相对理论 delta）
+#: 占位字符数量的候选偏移（相对理论 delta）
 _COUNT_CANDIDATES = (0, 1, 2, -1)
+#: 单次插入的字符数上限基数；实际上限为 ``max(_CHAR_CAP_BASE, delta + 2)``，
+#: 从而在大切片长度（delta 很大）时仍留有补偿余地。
+_CHAR_CAP_BASE = 8
+#: 主循环轮数上限的乘数因子与保底值（防御性护栏，与切片长度无关）。
+_ROUND_FACTOR = 4
+_ROUND_FLOOR = 16
+#: 插入后重新定位锚点时的搜索容差基数。
+_LOCATE_TOLERANCE_BASE = 4
+#: 单个 token 的候选尝试预算系数（相对 ``max_retries``）。
+_ATTEMPT_BUDGET_FACTOR = 12
 
 STATUS_ALIGNED = "ALIGNED"
 STATUS_PARTIAL = "PARTIAL"
@@ -157,12 +172,47 @@ def _occurrence_of(report: KeyTokenReport, decision) -> int:
 
 @dataclass
 class AlignConfig:
-    period: int = 4
-    max_retries: int = 6
-    insert_mode: str = INSERT_MODE_SEGMENT
+    """内部引擎配置。
+
+    ``period`` 为切片长度（phase period），即相位偏移的目标周期：关键 token
+    的索引会被推进到满足 ``index % period == 0`` 的新索引。默认取
+    :data:`phase_shifting.constants.DEFAULT_SLICE_LENGTH`；公共 API 层
+    （:mod:`phase_shifting.api`）以 ``slice_length`` 为名暴露同一参数，
+    本类另提供只读别名 :attr:`slice_length`。
+
+    Attributes:
+        period: 切片长度 / 相位周期，必须为正整数。
+        max_retries: 单个 token 的最大候选尝试预算。
+        insert_mode: 插入位置策略，``inline`` / ``segment``。
+        filler_priority: 占位符优先级（按名称）。
+        max_chars: 输入字符数上限保护。
+        restore_first: 是否在运行前剥离历史占位字符（幂等保证）。
+    """
+
+    period: int = DEFAULT_SLICE_LENGTH
+    max_retries: int = DEFAULT_MAX_RETRIES
+    insert_mode: str = INSERT_MODE_INLINE
     filler_priority: Optional[Sequence[str]] = None
-    max_chars: int = 200_000
+    max_chars: int = DEFAULT_MAX_CHARS
     restore_first: bool = True
+
+    def __post_init__(self) -> None:
+        if self.period <= 0:
+            raise ValueError("period（切片长度）必须为正整数，收到 %r" % self.period)
+        if self.insert_mode not in INSERT_MODES:
+            raise ValueError(
+                "未知 insert-mode：%s（可用：%s）"
+                % (self.insert_mode, ", ".join(INSERT_MODES))
+            )
+        if self.max_retries <= 0:
+            raise ValueError("max_retries 必须为正整数，收到 %r" % self.max_retries)
+        if self.max_chars <= 0:
+            raise ValueError("max_chars 必须为正整数，收到 %r" % self.max_chars)
+
+    @property
+    def slice_length(self) -> int:
+        """``period`` 的语义化别名：切片长度。"""
+        return self.period
 
 
 class Aligner:
@@ -196,8 +246,6 @@ class Aligner:
         if not self._strippable:  # pragma: no cover - 防御
             self._strippable = {registry.primary().char}
         self.config = config or AlignConfig()
-        if self.config.insert_mode not in INSERT_MODES:
-            raise ValueError("未知 insert-mode：%s" % self.config.insert_mode)
         self.validator = validator or DynamicValidator(tokenizer, self.config.period)
 
     # ------------------------------------------------------------------ 公共
@@ -208,16 +256,16 @@ class Aligner:
         if text is None:
             text = ""
         if len(text) > self.config.max_chars:
-            raise ValueError(
-                "输入过长：%d 字符 > 上限 %d（可用 --max-chars 调整）"
-                % (len(text), self.config.max_chars)
+            raise InputError(
+                "输入过长：%d 字符 > 上限 %d（可用 max_chars 调大）"
+                % (len(text), self.config.max_chars),
+                {"length": len(text), "max_chars": self.config.max_chars},
             )
 
         # 幂等策略分两步：
         #   1) 先对**原始输入**（含历史占位符）编码并判定；
-        #      若已全部对齐 → 直接零干预返回，不剥离、不重算。
-        #      这样"对已对齐文本再跑一次"不会产生任何插入。
-        #   2) 若仍有未对齐项 → 剥离历史占位符后从原文重新计算，
+        #      已全部对齐 → 零干预返回，不剥离、不重算；
+        #   2) 仍有未对齐项 → 剥离历史占位符后从原文重新计算，
         #      保证"同一份原文永远得到同一份结果"。
         encoded_before: Encoded = self.tokenizer.encode_with_tokens(text)
         report = self.selector.select(
@@ -285,17 +333,14 @@ class Aligner:
         # 迭代式主循环：每轮重新 tokenize，取"当前"第一个未对齐的关键 token。
         # 插入点紧贴该 token，且要求插入后前缀 token 零破坏，因此已对齐的
         # token 相位永不被扰动 —— 循环必然收敛（每轮至少消灭一个未对齐 token）。
-        # 上界取 4 倍决策数 + 16，纯粹是防御性护栏。
-        max_rounds = max(len(report.decisions) * 4, 16)
+        # 上界取 _ROUND_FACTOR 倍决策数 + _ROUND_FLOOR，纯粹是防御性护栏。
+        max_rounds = max(len(report.decisions) * _ROUND_FACTOR, _ROUND_FLOOR)
         seen_states: set = set()
         for round_no in range(max_rounds):
             enc_now = self.tokenizer.encode_with_tokens(working)
             rep_now = self.selector.select(
                 enc_now.tokens, enc_now.ids, self.tokenizer.vocab_size
             )
-            segments = split_segments(working)
-            token_segments = map_tokens_to_segments(working, enc_now.tokens, segments)
-            offsets_now = token_start_offsets(working, enc_now.tokens)
             pending = [
                 d for d in rep_now.decisions if d.needs_align(self.config.period)
             ]
@@ -307,10 +352,22 @@ class Aligner:
             target_before = decision.index
             delta = decision.delta_needed(self.config.period)
             anchor = enc_now.ids[target_before : target_before + 1]
-            seg = (
-                token_segments[target_before]
-                if target_before < len(token_segments)
-                else None
+
+            # 段落映射与字符偏移都是 O(文本长度) 的全量计算，而每轮只需要目标
+            # token 附近的信息；因此仅在非 inline 模式下才计算段落映射。
+            seg = None
+            if self.config.insert_mode != INSERT_MODE_INLINE:
+                segments = split_segments(working)
+                token_segments = map_tokens_to_segments(working, enc_now.tokens, segments)
+                seg = (
+                    token_segments[target_before]
+                    if target_before < len(token_segments)
+                    else None
+                )
+
+            # 只需要目标 token 的字符偏移，因此把计算限制在前缀范围内
+            offsets_now = token_start_offsets(
+                working, enc_now.tokens, limit=target_before + 1
             )
             base_offset = (
                 offsets_now[target_before]
@@ -413,7 +470,9 @@ class Aligner:
         * 目标归位：目标 token id 首次出现位置 ``j >= index`` 且
           ``j % period == 0``。
 
-        候选维度：占位种类 × 插入点（base ± 0/1/2/3）× 字符数（delta + 0/1/2）。
+        候选维度：占位种类 × 插入点（base ± 0/1/2/3）× 字符数（delta + 0/1/2/-1）。
+        字符数上限随 delta 放大（``max(_CHAR_CAP_BASE, delta + 2)``），保证大切片
+        长度下仍有补偿余地。
         """
         chain = self._filler_chain()
         last_validation: Optional[ValidationResult] = None
@@ -426,22 +485,28 @@ class Aligner:
 
         attempts = 0
         max_attempts = max(1, self.config.max_retries)
-        for spec in chain[:max_attempts]:
-            char_count = self._chars_for(delta, spec)
-            if char_count <= 0:
+        budget = max_attempts * _ATTEMPT_BUDGET_FACTOR
+        # 枚举顺序：插入点优先（off_delta=0 最常见），其次字符数补偿，最后占位种类。
+        # 每次验证都要整篇重新 tokenize，因此让最可能成功的组合排在最前面，
+        # 减少无效候选的全量编码次数。
+        for off_delta in _OFFSET_CANDIDATES:
+            offset = base_offset + off_delta
+            if offset < 0 or offset > len(working):
                 continue
 
             for adjust in _COUNT_CANDIDATES:
-                real_chars = char_count + adjust
-                if real_chars <= 0 or real_chars > 8:
-                    continue
-                payload = self.registry.render(spec.name, real_chars)
-
-                for off_delta in _OFFSET_CANDIDATES:
-                    offset = base_offset + off_delta
-                    if offset < 0 or offset > len(working):
+                for spec in chain[:max_attempts]:
+                    char_count = self._chars_for(delta, spec)
+                    if char_count <= 0:
                         continue
+
+                    char_cap = max(_CHAR_CAP_BASE, char_count + 2)
+                    real_chars = char_count + adjust
+                    if real_chars <= 0 or real_chars > char_cap:
+                        continue
+
                     attempts += 1
+                    payload = self.registry.render(spec.name, real_chars)
                     candidate = working[:offset] + payload + working[offset:]
 
                     ok, new_index, validation = self._verify_candidate(
@@ -477,15 +542,19 @@ class Aligner:
                             char_offset=offset,
                             attempt=attempts,
                             structural=spec.structural,
-                            note="%s（补偿 %+d）" % (spec.note, adjust) if adjust else spec.note,
+                            note="%s（补偿 %+d）" % (spec.note, adjust)
+                            if adjust
+                            else spec.note,
                         )
                         return True, insertion, validation, candidate
 
                     last_validation = validation
-                    if attempts >= max_attempts * 12:
+                    if attempts >= budget:
                         break
-                if attempts >= max_attempts * 12:
+                if attempts >= budget:
                     break
+            if attempts >= budget:
+                break
 
         return (
             False,
@@ -525,7 +594,10 @@ class Aligner:
 
         # 条件 B：目标 token 归位到相位 0
         locate = self.validator.locate_anchor(
-            anchor, ids_after, hint=target + inserted, tolerance=max(4, inserted + 4)
+            anchor,
+            ids_after,
+            hint=target + inserted,
+            tolerance=max(_LOCATE_TOLERANCE_BASE, inserted + _LOCATE_TOLERANCE_BASE),
         )
         result.locate = locate
         if not locate.found or locate.index is None:
@@ -589,9 +661,12 @@ class Aligner:
     def _insertion_offset(
         self, text: str, segment: Optional[Segment], decision
     ) -> Tuple[int, int]:
-        """计算插入点（字符偏移）与段落号。"""
+        """按 ``insert_mode`` 计算插入点（字符偏移）与段落号。
+
+        inline 模式下插入点紧贴目标 token 正前方（段落号记 ``-1``，仅用于报告）；
+        segment 模式下插入点取段落首部第一个非空白字符之前。
+        """
         if self.config.insert_mode == INSERT_MODE_INLINE:
-            # inline：尽量贴近 token 正前方；段落信息仅用于报告
             return self._token_char_offset(text, decision), -1
         if segment is None:
             return 0, -1
@@ -599,7 +674,7 @@ class Aligner:
 
     @staticmethod
     def _token_char_offset(text: str, decision) -> int:
-        """inline 模式：找 token 文本在文中的位置（找不到则退化为 0）。"""
+        """按 token 文本在文中的位置定位；找不到时返回 0。"""
         needle = decision.text
         if not needle:
             return 0
@@ -609,8 +684,8 @@ class Aligner:
     def _restore(self, text: str) -> Tuple[str, int]:
         """剥离"可安全剥离"的占位字符（不可见、无结构干扰的候选）。
 
-        结构型候选（如 ``lf`` 换行符）**不**参与剥离：原文里合法的换行
-        必须原样保留，否则会造成不可逆的段落结构破坏。
+        结构型候选（``lf`` 换行符）不参与剥离：其字符与原文合法换行无法区分，
+        纳入剥离会破坏段落结构。
         """
         return strip_fillers(text, sorted(self._strippable))
 
@@ -618,7 +693,7 @@ class Aligner:
     def restore(self, text: str) -> Tuple[str, int]:
         """公开的还原接口：剥离全部可安全剥离的占位字符。
 
-        只处理不可见、无结构干扰的候选；若曾使用结构型占位符（``lf``），
-        其换行符无法与原文换行区分，故保留不动。
+        只处理不可见、无结构干扰的候选；结构型占位符（``lf``）的换行符
+        无法与原文换行区分，故保留不动。
         """
         return self._restore(text)

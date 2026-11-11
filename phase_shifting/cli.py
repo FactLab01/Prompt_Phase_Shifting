@@ -1,25 +1,38 @@
 # -*- coding: utf-8 -*-
-"""CLI 入口。
+"""命令行前端：参数解析 → 调用 SDK → 渲染结果。
 
-用法示例::
+本模块不含任何业务逻辑。所有对齐行为都由 :mod:`phase_shifting.api`
+（:class:`~phase_shifting.api.PhaseShifter`）承载；这里只负责把命令行参数
+翻译成 :class:`~phase_shifting.config.PhaseShiftConfig`，再把
+:class:`~phase_shifting.api.AlignmentResult` 渲染给人看。
+
+用法示例（以下均假设已在虚拟环境中激活，或已 ``pip install .``）::
 
     # 1) 直接传文本
-    .venv\\Scripts\\python.exe -m phase_shifting --text "Hello world 关键信息"
+    python -m phase_shifting --text "Hello world 关键信息"
 
     # 2) 从文件读
-    .venv\\Scripts\\python.exe -m phase_shifting --file input.txt
+    python -m phase_shifting --file input.txt
 
     # 3) 从标准输入读（管道）
-    echo "..." | .venv\\Scripts\\python.exe -m phase_shifting -
+    echo "..." | python -m phase_shifting -
 
-    # 4) 关键词模式 + 差异视图 + JSON
-    .venv\\Scripts\\python.exe -m phase_shifting --file input.txt ^
-        --key-mode keywords --keywords 关键,secret --diff --json
+    # 4) 指定模型切片长度 + 关键词模式 + 差异视图 + JSON
+    python -m phase_shifting --file input.txt \
+        --slice-length 4 --key-mode keywords --keywords 关键,secret --diff --json
 
     # 5) 还原（幂等性兜底）
-    .venv\\Scripts\\python.exe -m phase_shifting --restore aligned.txt
+    python -m phase_shifting --restore aligned.txt
 
-子命令 ``restore`` 也可用：``python -m phase_shifting restore aligned.txt``。
+安装后也可直接用 ``phase-shifting`` 命令，与 ``python -m phase_shifting`` 等价。
+子命令形式同样可用：``python -m phase_shifting restore aligned.txt``。
+
+若需要以编程方式调用（无命令行），请直接使用 SDK::
+
+    from phase_shifting import align_text
+
+    result = align_text("Hello world 关键信息", slice_length=4)
+    print(result.aligned_text, result.summary())
 """
 
 from __future__ import annotations
@@ -35,14 +48,26 @@ from .aligner import (
     INSERT_MODE_INLINE,
     INSERT_MODE_SEGMENT,
     STATUS_ALIGNED,
-    AlignConfig,
-    Aligner,
+    STATUS_FAILED,
+    STATUS_PARTIAL,
+)
+from .api import AlignmentResult, PhaseShifter
+from .config import PhaseShiftConfig
+from .constants import (
+    DEFAULT_MAX_CHARS,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_SLICE_LENGTH,
+    DEFAULT_WEIGHT_THRESHOLD,
+    DEFAULT_WINDOW_AGG,
+    DEFAULT_WINDOW_SIZE,
 )
 from .diffview import render_diff, render_side_by_side
+from .errors import ConfigurationError, PhaseShiftingError
 from .fillers import FillerRegistry
-from .keytokens import KEY_MODES, KEY_MODE_AUTO, KeyTokenSelector
+from .weights import WINDOW_AGGS, WINDOW_AGG_SUM
+from .keytokens import KEY_MODES, KEY_MODE_AUTO
 from .logsetup import close_logger, get_logger, io_text_wrapper
-from .report import render_index_table_only, render_json, render_text
+from .report import render_index_table_only, render_text
 from .tokenizer_api import TokenizerHandle, get_tokenizer
 
 EXIT_OK = 0
@@ -85,7 +110,10 @@ def read_input(args: argparse.Namespace) -> Tuple[str, str]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="phase_shifting",
-        description="前置相位偏移 Demo：把关键 token 物理推进到 DeepSeek 注意力偏置位置（index %% 4 == 0）",
+        description=(
+            "前置相位偏移：把关键 token 物理推进到目标模型的注意力偏置位置"
+            "（index %% slice_length == 0）"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -94,7 +122,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--file", "-f", help="从指定 UTF-8 文件读取文本")
     parser.add_argument("-", dest="dash", action="store_true", help="显式从标准输入读取")
 
-    parser.add_argument("--period", "-p", type=int, default=4, help="相位周期，默认 4")
+    parser.add_argument(
+        "--slice-length",
+        "-p",
+        type=int,
+        default=DEFAULT_SLICE_LENGTH,
+        dest="slice_length",
+        help=(
+            "切片长度：目标模型一次前向处理的 token 数，关键 token 索引会被推进到 "
+            "index %% slice_length == 0。默认 %d；不同模型请显式传入"
+            % DEFAULT_SLICE_LENGTH
+        ),
+    )
+    parser.add_argument(
+        "--period",
+        type=int,
+        default=None,
+        dest="period",
+        help="--slice-length 的兼容别名（已废弃，优先使用 --slice-length）",
+    )
     parser.add_argument(
         "--key-mode",
         choices=list(KEY_MODES),
@@ -103,7 +149,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--keywords", help="关键词列表，逗号分隔（key-mode=keywords 时必填）")
     parser.add_argument(
-        "--weight-threshold", type=float, default=0.5, help="语义权重阈值（key-mode=weight）"
+        "--weight-threshold",
+        type=float,
+        default=DEFAULT_WEIGHT_THRESHOLD,
+        help="语义权重阈值（key-mode=weight）",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=DEFAULT_WINDOW_SIZE,
+        help=(
+            "宏观窗口长度（token 数），0 表示关闭、逐 token 判定；"
+            "建议取目标模型步长的整数倍（key-mode=weight 时生效）"
+        ),
+    )
+    parser.add_argument(
+        "--window-agg",
+        choices=list(WINDOW_AGGS),
+        default=WINDOW_AGG_SUM,
+        help="窗口内聚合方式：sum=权重总和，count=高分词个数（默认 sum）",
     )
     parser.add_argument(
         "--fillers", help="占位符优先级，逗号分隔，如 zwsp,bom,mix（默认自动排序）"
@@ -112,10 +176,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--insert-mode",
         choices=(INSERT_MODE_SEGMENT, INSERT_MODE_INLINE),
         default=INSERT_MODE_INLINE,
-        help="插入位置：token 正前方（默认，保证循环收敛）或段落头部（兼容模式）",
+        help="插入位置：token 正前方（默认，满足前缀零破坏）或段落头部",
     )
-    parser.add_argument("--max-retries", type=int, default=6, help="单个 token 的最大重试次数")
-    parser.add_argument("--max-chars", type=int, default=200000, help="输入字符上限保护")
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help="单个 token 的最大候选尝试预算",
+    )
+    parser.add_argument(
+        "--max-chars", type=int, default=DEFAULT_MAX_CHARS, help="输入字符上限保护"
+    )
     parser.add_argument("--no-restore", action="store_true", help="不做幂等还原（默认会先剥离历史占位符）")
 
     parser.add_argument("--diff", action="store_true", help="输出插入前后的可读差异视图")
@@ -146,8 +217,43 @@ def _parse_fillers(raw: Optional[str]) -> Optional[List[str]]:
     return [f.strip() for f in raw.split(",") if f.strip()]
 
 
+#: ``--period`` 与 ``--slice-length`` 冲突时的告警文案（两处调用点共用）
+_PERIOD_DEPRECATED_WARNING = (
+    "警告：--period 已废弃，且与 --slice-length 同时给出；以 --slice-length 为准"
+)
+
+
+def _slice_length_explicit(argv: Optional[List[str]]) -> bool:
+    """命令行里是否显式给出了 ``--slice-length`` / ``-p``。"""
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    return any(
+        tok in ("--slice-length", "-p")
+        or tok.startswith("--slice-length=")
+        or tok.startswith("-p=")
+        for tok in tokens
+    )
+
+
+def _resolve_slice_length(
+    args: argparse.Namespace, argv: Optional[List[str]] = None
+) -> int:
+    """解析生效的切片长度。
+
+    ``--slice-length`` 是正式参数；``--period`` 仅为兼容别名。两者都显式给出时
+    以 ``--slice-length`` 为准，并由调用方打印 :data:`_PERIOD_DEPRECATED_WARNING`。
+    """
+    slice_length = args.slice_length
+    if args.period is None:
+        return slice_length
+    return slice_length if _slice_length_explicit(argv) else args.period
+
+
 # ---------------------------------------------------------------------- 主流程
 def run(args: argparse.Namespace) -> int:
+    """CLI 薄壳：解析参数 → 调 SDK → 渲染结果。
+
+    本函数不含任何业务逻辑；对齐行为完全由 :mod:`phase_shifting.api` 承载。
+    """
     logger = get_logger(
         level=args.log_level,
         log_file=args.log_file,
@@ -170,33 +276,45 @@ def run(args: argparse.Namespace) -> int:
     text, source = read_input(args)
     logger.info("输入来源：%s，长度 %d 字符", source, len(text))
 
-    registry = FillerRegistry(tokenizer)
-    filler_chars = [registry.get(n).char for n in registry.names()]
-    selector = KeyTokenSelector(
-        mode=args.key_mode,
-        keywords=_parse_keywords(args.keywords),
-        weight_threshold=args.weight_threshold,
-        tokenizer=tokenizer,
-        filler_chars=filler_chars,
-    )
-    config = AlignConfig(
-        period=args.period,
-        max_retries=max(1, args.max_retries),
-        insert_mode=args.insert_mode,
-        filler_priority=_parse_fillers(args.fillers),
-        max_chars=args.max_chars,
-        restore_first=not args.no_restore,
-    )
-    aligner = Aligner(tokenizer, selector, registry, config)
+    # ------------------------------------------------------- 组装 SDK 配置
+    slice_length = _resolve_slice_length(args)
+
+    try:
+        config = PhaseShiftConfig(
+            slice_length=slice_length,
+            key_mode=args.key_mode,
+            keywords=_parse_keywords(args.keywords),
+            weight_threshold=args.weight_threshold,
+            window_size=args.window_size,
+            window_agg=args.window_agg,
+            insert_mode=args.insert_mode,
+            filler_priority=_parse_fillers(args.fillers),
+            max_retries=max(1, args.max_retries),
+            max_chars=args.max_chars,
+            restore_first=not args.no_restore,
+        )
+    except ConfigurationError as exc:
+        print("错误：%s" % exc, file=sys.stderr)
+        return EXIT_USAGE
+
+    shifter = PhaseShifter(config, tokenizer=tokenizer)
 
     def emit(message: str) -> None:
         logger.info(message)
 
-    outcome = aligner.align(text, progress=emit)
+    try:
+        result = shifter.align(text, progress=emit)
+    except PhaseShiftingError as exc:
+        print("错误：%s" % exc, file=sys.stderr)
+        logger.error("%s: %s", exc.code, exc)
+        return EXIT_FAILED
+
+    # 适配为报告层期望的结果对象
+    outcome = _to_outcome(result, tokenizer)
 
     # ------------------------------------------------------------------ 输出
     if args.json:
-        print(render_json(outcome, tokenizer))
+        print(result.to_json())
     elif args.table:
         print(render_index_table_only(outcome, tokenizer))
     else:
@@ -220,11 +338,70 @@ def run(args: argparse.Namespace) -> int:
 
     if outcome.status == STATUS_ALIGNED:
         return EXIT_OK
-    if outcome.status == "PARTIAL":
+    if outcome.status == STATUS_PARTIAL:
         return EXIT_PARTIAL
-    if outcome.status == "FAILED":
+    if outcome.status == STATUS_FAILED:
         return EXIT_FAILED
     return EXIT_OK
+
+
+def _to_outcome(result: "AlignmentResult", tokenizer: TokenizerHandle):
+    """把 SDK 的 :class:`AlignmentResult` 适配为报告层使用的对象。
+
+    报告渲染只需要 ``status`` / ``original_text`` / ``aligned_text`` /
+    ``period`` / ``total_tokens_before`` / ``total_tokens_after`` /
+    ``key_report`` / ``insertions`` / ``failures`` / ``message`` 这些字段；
+    这里用轻量适配器补齐，避免 CLI 直接依赖引擎内部类型。
+    """
+    from .aligner import AlignOutcome
+    from .keytokens import KeyTokenDecision, KeyTokenReport
+
+    report = KeyTokenReport(decisions=[])
+    for entry in result.key_tokens:
+        report.decisions.append(
+            KeyTokenDecision(
+                index=entry["index"],
+                token_id=entry["token_id"],
+                token=entry["token"],
+                text=entry["token"],
+                is_key=True,
+                reason=entry.get("reason", ""),
+            )
+        )
+
+    # SDK 的插入明细以 JSON 友好键命名（"filler" / "structural_interference"），
+    # 报告层沿用引擎字段名（"filler_name" / "structural"）；此处做一次键名映射，
+    # 避免报告层感知两种命名。
+    _KEY_ALIASES = {
+        "filler_name": "filler",
+        "structural": "structural_interference",
+    }
+
+    class _InsertionView:
+        """把插入明细字典还原为报告层期望的属性访问形式。"""
+
+        def __init__(self, data: dict) -> None:
+            self._data = data
+
+        def __getattr__(self, name: str):
+            key = _KEY_ALIASES.get(name, name)
+            try:
+                return self._data[key]
+            except KeyError as exc:  # pragma: no cover - 防御
+                raise AttributeError(name) from exc
+
+    return AlignOutcome(
+        status=result.status,
+        original_text=result.original_text,
+        aligned_text=result.aligned_text,
+        period=result.slice_length,
+        total_tokens_before=result.tokens_before,
+        total_tokens_after=result.tokens_after,
+        key_report=report,
+        insertions=[_InsertionView(d) for d in result.insertions],
+        failures=list(result.failures),
+        message=result.message,
+    )
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -244,8 +421,24 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = parser.parse_args(argv)
 
-    if args.period <= 0:
-        print("错误：--period 必须为正整数", file=sys.stderr)
+    # --period 是 --slice-length 的兼容别名；两者都显式给出时以 --slice-length 为准
+    resolved = _resolve_slice_length(args, argv)
+    if (
+        args.period is not None
+        and args.period != args.slice_length
+        and resolved == args.slice_length
+        and _slice_length_explicit(argv)
+    ):
+        print(_PERIOD_DEPRECATED_WARNING, file=sys.stderr)
+    args.slice_length = resolved
+
+    # 切片长度的最终校验交给 SDK 配置层（ConfigurationError → EXIT_USAGE），
+    # 这里只保留一次快速失败，避免把明显的非正数带进引擎。
+    if args.slice_length <= 0:
+        print(
+            "错误：--slice-length 必须为正整数，收到 %r" % (args.slice_length,),
+            file=sys.stderr,
+        )
         return EXIT_USAGE
 
     try:
@@ -278,9 +471,9 @@ def _run_restore(rest: List[str], parser: argparse.ArgumentParser) -> int:
     else:
         text = sys.stdin.read()
 
-    registry = FillerRegistry(tokenizer)
-    aligner = Aligner(tokenizer, KeyTokenSelector(), registry, AlignConfig())
-    restored, removed = aligner.restore(text)
+    shifter = PhaseShifter(tokenizer=tokenizer)
+    restored = shifter.restore(text)
+    removed = len(text) - len(restored)
     logger.info("剥离 %d 个占位字符（%d → %d 字符）", removed, len(text), len(restored))
 
     if ns.output:

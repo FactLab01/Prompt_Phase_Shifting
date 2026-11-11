@@ -50,6 +50,10 @@ coverage.xml
 *.lcov
 .hypothesis/
 .pytest_cache/
+demo/run_demo_local_only.py
+demo/demo_template.py
+demo/violent_test/answer.log
+demo/violent_test/article.txt
 cover/
 
 # Translations
@@ -160,6 +164,9 @@ tmp/
 ENV/
 env.bak/
 venv.bak/
+
+# Project wiki
+/wiki
 
 # Spyder project settings
 .spyderproject

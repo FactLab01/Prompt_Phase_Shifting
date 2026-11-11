@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import unittest
 
+from phase_shifting.constants import DEFAULT_SLICE_LENGTH
 from phase_shifting.keytokens import (
     KEY_MODE_AUTO,
     KEY_MODE_KEYWORDS,
@@ -143,11 +144,12 @@ class KeyTokenSelectorTest(unittest.TestCase):
 
     def test_delta_needed(self):
         rep = self._select(mode=KEY_MODE_AUTO)
+        period = DEFAULT_SLICE_LENGTH
         for d in rep.decisions:
             if d.is_key:
-                delta = d.delta_needed(4)
-                self.assertTrue(0 <= delta < 4)
-                self.assertEqual((d.index + delta) % 4, 0)
+                delta = d.delta_needed(period)
+                self.assertTrue(0 <= delta < period)
+                self.assertEqual((d.index + delta) % period, 0)
 
     def test_describe(self):
         self.assertIn("auto", KeyTokenSelector().describe())

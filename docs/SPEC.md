@@ -1,7 +1,8 @@
-# 前置相位偏移 Demo — 实现规范与分阶段计划
+# 前置相位偏移 SDK — 实现规范与分阶段计划
 
-> 目标：把用户输入中的**关键 token** 通过"动态插入无害 Token"物理推进到 DeepSeek 的
-> 注意力偏置位置（`token_index % 4 == 0`），且全程只在 `./.venv` 虚拟环境内运行。
+> 目标：把用户输入中的**关键 token** 通过"动态插入无害 Token"物理推进到目标模型的
+> 注意力偏置位置（`token_index % slice_length == 0`，默认 `slice_length = 4`），
+> 以可直接调用的 Python SDK 形式交付，CLI 仅作为可选前端。
 
 ---
 
@@ -9,19 +10,28 @@
 
 | 术语 | 含义 |
 | --- | --- |
-| 相位（phase） | token 在序列中的下标 `i` 对 `period`（默认 4）取模的结果，即 `i % 4` |
-| 目标相位 | 本 Demo 约定 `i % period == 0`，即下标能被 `period` 整除的位置 |
+| 切片长度（slice_length） | 目标模型一次前向处理的 token 数；由调用方显式传入，默认 4。引擎内部同义字段名为 `period` |
+| 相位（phase） | token 在序列中的下标 `i` 对 `slice_length` 取模的结果，即 `i % slice_length` |
+| 目标相位 | 约定 `i % slice_length == 0`，即下标能被 `slice_length` 整除的位置 |
 | 关键 token | 需要被对齐的 token，默认判定为"非空白、非纯标点"，可由关键词/权重阈值自定义 |
 | 占位 token（filler） | 插入的不可见字符，在 tokenizer 下可稳定编码、不引入语义噪声 |
 | 物理推进 | 不修改模型，只改文本，使关键 token 的真实下标发生位移 |
 
-## 2. 虚拟环境（硬约束）
+## 2. 环境要求
 
-- 唯一允许的解释器：`./.venv/Scripts/python.exe`（Python 3.13.12）。
-- 已预装：`deepseek-tokenizer==0.3.0`（纯 Python 实现，BPE + ByteLevel 预分词）。
-- 任何安装/卸载必须形如：
-  `./.venv/Scripts/python.exe -m pip install <pkg>`，**严禁触碰全局环境**。
-- 当前 Demo 运行**零第三方依赖**（仅标准库 + deepseek-tokenizer），测试同样用标准库 `unittest`。
+- Python ≥ 3.9（开发与实测所用版本为 3.13）。
+- 运行时唯一第三方依赖：`deepseek-tokenizer>=0.3.0`（纯 Python 实现，BPE + ByteLevel 预分词）。
+- 测试用标准库 `unittest`，不引入额外依赖。
+- 打包需要 `setuptools>=68`（见 `pyproject.toml`）；仅在执行 `pip install .` 时才需要。
+
+> 推荐（而非必须）在虚拟环境中开发与测试，任选其一：
+>
+> ```bash
+> python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+> pip install -e .
+> ```
+>
+> 也可直接装进当前环境：`pip install .`
 
 ## 3. Tokenizer 行为结论（来自实测探针）
 
@@ -46,7 +56,10 @@ ByteLevel 使用 GPT-2 字节映射，因此：
 
 ## 4. 功能规格
 
-### 4.1 输入来源（三选一，可组合优先级：`--file` > `--text` > stdin）
+### 4.1 输入来源
+
+SDK 调用方直接传入 `str`（`align_text(text, ...)`）；CLI 前端额外支持三种来源
+（可组合，优先级：`--file` > `--text` > stdin）：
 
 | 来源 | 参数 |
 | --- | --- |
@@ -61,22 +74,41 @@ ByteLevel 使用 GPT-2 字节映射，因此：
 | 默认 `--key-mode auto` | — | token 文本去空白/纯标点后非空即为关键 token |
 | 关键词 | `--keywords a,b,c` | token 文本含任一关键词（大小写不敏感） |
 | 权重阈值 | `--weight-threshold 0.5` | token 的"语义权重" ≥ 阈值即为关键 token |
+| 权重阈值 + 宏观窗口 | `--weight-threshold 0.5 --window-size 16 --window-agg sum` | 语义权重 ≥ 阈值 **且** 落在 Peak Window 内 |
 
 语义权重打分（`phase_shifting/weights.py`）：
 `w = 0.5·len_norm + 0.3·is_word + 0.2·rarity`，其中 `len_norm = min(len(tok),8)/8`，
 `is_word` 为"是否字母/汉字/CJK 连续块"，`rarity = 1 - min(id, 100000)/vocab_size` 的归一化
 近似（token id 越大通常越罕见）。该公式仅用于演示"可插拔权重"机制。
 
+#### 4.2.1 宏观窗口（Peak Window）
+
+`--window-size N`（`N > 0`）在权重模式上叠加段落级判定，用于回答"哪一段最重要"：
+
+1. 对全流做单点打分，得到基础权重数组 `W`（长度 = token 数）；
+2. 窗口长度 `N` 在 `W` 上滑动，每窗算一个分数，得窗口分数序列 `S`；
+3. 聚合方式 `--window-agg`：`sum`（窗内权重总和，默认）或 `count`（窗内 ≥ 阈值的 token 个数）；
+4. 取 `S` 最大值所在窗为 Peak Window；**多个同分取最靠前者**（确定性要求）；
+5. 只有峰窗内的 token 才可能被判为关键 token，峰窗外一律判否。
+
+约束与退化：
+
+- `--window-size 0`（默认）关闭窗口化，退回逐 token 判定，行为与本特性引入前完全一致；
+- 非零 `--window-size` 仅在 `--key-mode weight` 下合法，其余模式直接报 `ConfigurationError`；
+- 全文 token 数 `< N` 时无窗可选，退化为全流判定，`AlignmentPlan.peak_window` 为 `None`；
+- 窗口化判定与 token 位置相关，因此**不参与** `(mode, token_id, threshold)` 判定缓存；
+- 建议 `N` 取目标模型步长（stride）的整数倍，常见 64 / 128。
+
 ### 4.3 插入策略（最小干预）
 
-对每个关键 token，若其下标 `i % period != 0`：
+目标相位由 `slice_length` 决定（SDK 参数 / CLI `--slice-length`，默认 4，见 5.1）。
+对每个关键 token，若其下标 `i % slice_length != 0`：
 
-1. 计算所需位移 `delta = (period - i % period) % period`，若 `delta == 0` 则跳过；
-2. `delta ∈ {1,2,3}`，**每个占位字符 = 1 个 token**（用 ZWSP/BOM 这类 1:1 字符），
-   因此"插入 k 个字符"即可精确推进 k 位；
-3. 占位符**插入到该 token 所属的"文档段落/片段"起始处**（见 4.4），保证原始段落结构不被打散；
+1. 计算所需位移 `delta = (slice_length - i % slice_length) % slice_length`，若 `delta == 0` 则跳过；
+2. 每个占位字符 = 1 个 token（ZWSP/BOM 这类 1:1 字符），因此"插入 k 个字符"即推进 k 位；
+3. 占位符**紧贴目标 token 正前方**插入（见 4.4），保证已对齐 token 的相位不受扰动；
 4. 插入后**立即重新 tokenize 全文做动态校验**（见 4.5）；
-5. 若未对齐（例如该处预分词导致占位符合并），则切换占位符种类或调整数量重试，
+5. 若未对齐（例如该处预分词导致占位符合并），则切换插入点 / 数量 / 占位种类重试，
    直到成功或达到 `--max-retries`（默认 6）。
 
 占位符种类（`phase_shifting/fillers.py`，按优先级排序）：
@@ -85,12 +117,12 @@ ByteLevel 使用 GPT-2 字节映射，因此：
 | --- | --- | --- | --- |
 | `zwsp` | 零宽空格 | U+200B | 1 |
 | `bom` | 零宽不换行空格(BOM) | U+FEFF | 1 |
-| `zwsp+bom` | 交替混合 | — | 1（每个字符） |
-| `word_joiner` | 零宽连接符 | U+2060 | 2（仅兜底） |
-| `newline` | 换行 | U+000A | 1（会改变段落结构，兜底） |
+| `mix` | zwsp/bom 交替混合 | — | 1（每个字符） |
+| `wj` | 零宽连接符 | U+2060 | 2（仅末位候选） |
+| `lf` | 换行 | U+000A | 1（会改变段落结构，末位候选） |
 
 > 探针结论：只有前三种满足"1 字符 = 1 token 且线性、可独立、不与邻居合并"。
-> `word_joiner` / `newline` 只在重试阶段作为兜底，并在报告中标注"结构有干扰"。
+> `wj` / `lf` 排在候选链末位，若被使用则在报告中标注"结构有干扰"。
 
 ### 4.4 插入点定位
 
@@ -110,9 +142,8 @@ offs[k] = byte_to_char_map(text)[pos_k + shift]    # 字节偏移 → 字符下�
 - **前缀零破坏**：`encode(text[:offs[k]])` 等于 `ids[:k]`，已对齐 token 的相位
   永不受扰动 —— 这是循环收敛的根本保证。
 
-> 设计约束：插入点若落在目标 token 所属**段落头部**，会推动该段落内所有 token 的
-> 下标，造成"修好一个、推歪另一个"的级联抖动，无法保证收敛。
-> `--insert-mode segment` 仅作为兼容模式保留。
+> `--insert-mode segment` 把插入点改到段落首部，会推动该段落内所有 token 的下标，
+> 不满足前缀零破坏；默认与推荐值为 `inline`。
 
 候选插入点为 `base + {0, ±1, ±2, ±3}`，用于吸收多字节字符被 BPE 切到字节中间时
 插入点只能回退到字符起点所带来的偏差。
@@ -126,7 +157,7 @@ ids2      = tokenizer.encode(candidate)        # 立即重新 tokenize 全文
 if ids2[:t] != ids[:t]:        -> 拒绝该候选
 # 条件 B：目标 token 归位
 j = ids2 中目标 id 首次出现且 >= t 的位置
-if j is None or j % period != 0: -> 换候选重试
+if j is None or j % L != 0:       -> 换候选重试（L = slice_length）
 ```
 
 定位方式：以"关键 token 的原始 id 序列"为锚点，在新 token 流中做**带偏移的滑窗匹配**，
@@ -141,15 +172,19 @@ if j is None or j % period != 0: -> 换候选重试
 - 整体结论：`ALIGNED` / `PARTIAL` / `FAILED`，及失败原因；
 - 可选 `--diff`：给出插入前后的可读差异视图（用可见记号 `<ZWSP>` 标注不可见字符）。
 
+以 SDK 方式调用时，上述内容由 `AlignmentResult` 结构化承载（`status` / `insertions` /
+`key_tokens` / `to_json()` 等），调用方可自行决定呈现形式；CLI 的文本/表格/JSON 三种
+渲染只是其中一种呈现。
+
 ## 5. 边界与健壮性场景（必须全部覆盖）
 
 | # | 场景 | 预期行为 |
 | --- | --- | --- |
 | E1 | 空输入 | 直接返回 `ALIGNED`（0 token，无需插入），不抛异常 |
 | E2 | 纯空白输入 | 同上，`ALIGNED`，无插入 |
-| E3 | 已天然对齐（所有关键 token 下标 % 4 == 0） | 零插入，输出"无需插入" |
+| E3 | 已天然对齐（所有关键 token 下标 % slice_length == 0） | 零插入，输出"无需插入" |
 | E4 | 多个连续 token 均未对齐 | 逐个处理，前缀零破坏保证已对齐 token 不受扰动，最终全部对齐 |
-| E5 | 超长输入 | `--max-chars` 上限保护（超出抛 `ValueError`）；测试用数百段文本验证不超时 |
+| E5 | 超长输入 | `--max-chars` 上限保护（超出抛 `InputError`，同时是 `ValueError`）；测试用长文本验证不超时 |
 | E6 | 占位符被 tokenizer 意外合并/拆分 | 双条件验收捕获 → 切换插入点/数量/种类重试 → 仍失败则记入 `failures` |
 | E7 | 重复运行（幂等性） | 已对齐文本二次运行零插入、结果一致；提供 `restore` 子命令还原 |
 | E8 | 关键词/权重模式无匹配 | 明确提示"未识别到关键 token"，不插入 |
@@ -162,9 +197,14 @@ if j is None or j % period != 0: -> 换候选重试
 
 ```
 phase_shifting/
-├── __init__.py        # 包导出与版本
+├── __init__.py        # 公共 API 再导出 + __version__
 ├── __main__.py        # python -m phase_shifting 入口
-├── cli.py             # argparse CLI 入口、输入源解析、报告渲染
+├── constants.py       # 默认值唯一来源：DEFAULT_SLICE_LENGTH 等
+├── errors.py          # 结构化异常体系（PhaseShiftingError 及子类）
+├── config.py          # PhaseShiftConfig：调用方与 SDK 的唯一配置契约
+├── api.py             # SDK 门面：PhaseShifter / align_text / plan_text / restore_text
+├── primitives.py      # C-ABI 原语层：位置参数 + 基础类型的稳定窄接口
+├── cli.py             # CLI 薄壳：参数解析 → 调 SDK → 渲染（不含业务逻辑）
 ├── tokenizer_api.py   # deepseek-tokenizer 封装（encode/decode/token 字符串/健康检查）
 ├── fillers.py         # 无害占位符注册表（字符、码点、token 成本、稳定性探针）
 ├── segments.py        # 段落切分、token→段落归属、插入点计算
@@ -174,8 +214,73 @@ phase_shifting/
 ├── validator.py       # 动态校验器（重新 tokenize + 锚点滑窗定位）
 ├── diffview.py        # 插入前后可读差异视图
 ├── report.py          # 结果数据类与渲染
-└── logsetup.py        # 日志模块（文件 + 控制台，可调级别）
+├── logsetup.py        # 日志模块（文件 + 控制台，可调级别）
+└── py.typed           # PEP 561 类型标记（随包分发）
 ```
+
+分层原则：`cli` 只依赖 `api` / `config` / `constants` / `errors` 与展示层；
+`api` 依赖引擎（`aligner` 等）但不暴露引擎内部类型；`primitives` 只依赖
+`constants` / `tokenizer_api` 并在函数体内惰性导入 `api`，避免环状依赖。
+
+## 5.1 切片长度参数化（硬约束）
+
+`4` 是当前模型的切片长度，但**不写死在实现里**：
+
+* 唯一定义处：`phase_shifting/constants.py` 的 `DEFAULT_SLICE_LENGTH = 4`；
+* 公共 API 以 `slice_length` 为显式参数暴露，默认取该常量，接受任意正整数：
+  * `PhaseShiftConfig(slice_length=...)`
+  * `PhaseShifter(config, slice_length=...)`
+  * `align_text(text, slice_length=...)`
+  * `primitives.align_text(text, slice_length)`
+  * CLI `--slice-length / -p`
+* 引擎内部（`AlignConfig.period`、`DynamicValidator.period`、`ValidationResult.period`）
+  的默认值同样引用常量，并提供 `slice_length` 只读别名；
+* 引擎字段名 `period` 与 `slice_length` 同义，新代码统一使用 `slice_length`；
+* 该约束由 `tests/test_packaging.py` 的 AST 扫描守护：除常量定义与具名模块级
+  常量外，任何位置出现字面量 `4` 都会导致测试失败。
+
+## 5.2 公共 API 契约
+
+| 入口 | 说明 |
+| --- | --- |
+| `align_text(text, *, config=None, slice_length=None, tokenizer=None, progress=None) -> AlignmentResult` | 函数式一次性对齐 |
+| `plan_text(text, *, config=None, slice_length=None, tokenizer=None) -> AlignmentPlan` | 只读分析，不修改文本 |
+| `restore_text(text, *, tokenizer=None) -> str` | 剥离占位字符 |
+| `PhaseShifter(config=None, *, slice_length=None, tokenizer=None)` | 可复用门面，提供 `align` / `plan` / `restore` / `align_many` |
+| `PhaseShiftConfig` | 配置对象，`to_dict()` / `from_dict()` 可无损往返 |
+| `AlignmentResult` | `status` / `aligned_text` / `slice_length` / `tokens_before` / `tokens_after` / `insertions` / `failures` / `key_tokens`，派生 `success` / `aligned_count` / `token_delta`，支持 `summary()` / `to_dict()` / `to_json()` |
+| `AlignmentPlan` | `slice_length` / `total_tokens` / `key_count` / `misaligned` / `aligned` / `peak_window`，派生 `needs_alignment` |
+
+全部公共函数与类均有完整类型标注和文档字符串；CLI 仅为可选前端。
+
+## 5.3 结构化异常体系
+
+```
+PhaseShiftingError                 # 基类，带 code / message / details
+├── ConfigurationError (ValueError)
+│   └── UnknownFillerError (KeyError)
+├── InputError (ValueError)
+├── TokenizerError (RuntimeError)
+└── AlignmentError (RuntimeError)
+    ├── AnchorLostError
+    └── RetryExhaustedError
+```
+
+每个异常**同时**继承对应内置异常，因此既有基于 `ValueError` / `KeyError` /
+`RuntimeError` 的 `except` 分支无需改写。`describe(exc)` 产出可 JSON 序列化的
+`{"code", "message", "details"}` 摘要，供报告与日志使用。
+
+## 5.4 C-ABI 原语层（P2 预备）
+
+`phase_shifting/primitives.py` 面向未来 C-ABI 绑定，刻意保持最窄签名约定：
+
+* 仅位置参数，无 `*args` / `**kwargs`；
+* 参数与返回值仅限可无损映射到 C 的基础类型（`str` / `int` / `Sequence[int]` / `Dict[str, Any]`）；
+* 无可变默认值、无回调；
+* 函数名与语义保持稳定，`PRIMITIVE_SIGNATURES` 提供人类可读签名清单。
+
+现有原语：`encode` / `decode` / `token_strings` / `token_count` /
+`align_text` / `align_text_detailed` / `restore_text`。
 
 ## 7. 核心算法流程
 
@@ -198,7 +303,8 @@ phase_shifting/
          │                       ▼
          │      ┌───────────────────────────────┐
          │      │ 取第一个未对齐 token t          │
-         │      │ delta = (period - i%p) % p     │
+         │      │ delta = (L - i%L) % L          │
+         │      │   （L = slice_length，默认 4）  │
          │      │ base  = token_start_offsets(t) │
          │      └───────────────┬───────────────┘
          │                      ▼
@@ -229,6 +335,11 @@ phase_shifting/
 
 | 文件 | 覆盖 |
 | --- | --- |
+| `test_config.py` | 默认值与常量层一致、`slice_length` 接受任意正整数、`period` 只读别名、非法值抛 `ConfigurationError`、`to_dict`/`from_dict` 往返 |
+| `test_errors.py` | 异常层级、`code` 稳定性、与内置异常（`ValueError`/`KeyError`/`RuntimeError`）的多重继承兼容、`describe()` 可 JSON 序列化 |
+| `test_sdk_api.py` | `align_text` / `PhaseShifter` / `plan_text` / `restore_text`、`slice_length` 显式传参与覆盖、`align_many`、`to_json`、`from_outcome` 适配、异常面 |
+| `test_primitives.py` | 原语签名清单完整、无 `*args`/`**kwargs`、全部参数有类型标注、基础类型往返、`slice_length` 位置传参与关键字传递 |
+| `test_packaging.py` | **架构守护**：AST 扫描保证切片长度字面量只出现在常量定义处、`py.typed` 存在、`pyproject.toml` 元数据/入口/依赖齐全、CLI 不含引擎逻辑、无 `/tmp` 与全局环境污染 |
 | `test_tokenizer_api.py` | 封装正确性、encode/decode 往返、token 字符串可见化、`locate_index_nth`、异常输入 |
 | `test_fillers.py` | 每个候选占位符的 token 成本实测、1:1 线性、不与邻居合并、优先级链 |
 | `test_segments.py` | 段落切分（空行/单段/CRLF）、token→段落归属、`token_start_offsets` 前缀不变量、字节↔字符映射 |
@@ -237,7 +348,9 @@ phase_shifting/
 | `test_validator.py` | 锚点滑窗定位、定位丢失、容忍带、合并/拆分场景下的校验失败 |
 | `test_diffview.py` | 差异视图渲染（不可见字符转 `<ZWSP>` 记号） |
 | `test_report.py` | 报告渲染（文本 / JSON / index 对比表） |
-| `test_e2e.py` | CLI 端到端：`--file`、stdin、`--text`、`--diff`、`restore` 子命令、退出码、幂等性 |
+| `test_e2e.py` | CLI 端到端：`--file`、stdin、`--text`、`--slice-length`、`--diff`、`restore` 子命令、退出码、幂等性 |
+
+当前状态：**324 项全部通过**（`unittest discover -s tests` → `OK`）。
 
 ## 9. 分阶段执行计划
 
@@ -249,11 +362,17 @@ phase_shifting/
 | P3 | 结构模块 | `segments` / `keytokens` / `weights` 单测通过 | ✅ |
 | P4 | 核心引擎 | `aligner` / `validator` 单测通过 | ✅ |
 | P5 | CLI 与报告 | `python -m phase_shifting --text ...` 输出完整报告 | ✅ |
-| P6 | 测试全套 + README | `unittest discover` 166 项全绿，README 说明安装/运行/调试 | ✅ |
+| P6 | 测试全套 + README | `unittest discover` 全绿，README 说明安装/运行/调试 | ✅ |
+| P7 | SDK 化 + 打包 | `pyproject.toml` 可安装、公共 API 可导入调用、切片长度参数化、原语层就绪 | ✅ |
+| P8 | weight 宏观窗口 | `window_size` / `window_agg` 参数化、Peak Window 定位、`peak_window` 暴露 | ✅ |
 
-## 10. 交付声明
+## 10. 交付与验证状态
 
-- 虚拟环境路径：`c:/Users/Administrator/Documents/Test/Prompt_Phase_Shifting/.venv`
-- 运行方式：`.venv/Scripts/python.exe -m phase_shifting ...`
-- 调试方式：`.venv/Scripts/python.exe -m unittest discover -s tests -v`
-- 依赖变更：无（仅使用已预装的 `deepseek-tokenizer==0.3.0`，未污染全局环境）
+- 运行方式：`python -m phase_shifting ...`（或安装后的 `phase-shifting` 命令）
+- 测试方式：`python -m unittest discover -s tests`
+- 依赖：`deepseek-tokenizer>=0.3.0`；打包需 `setuptools>=68`
+- 安装与调用已验证：`pip install .` 成功；从源码目录外导入 `phase_shifting`
+  并调用公共 API 全部通过；`python -m phase_shifting` 与 `phase-shifting` 均可用
+- 测试状态：**324 项全部通过**（`unittest discover -s tests` → `OK`），
+  其中 `tests/test_window_weight.py` 34 项覆盖宏观窗口（纯函数 / 选择器 / 对齐集成三层）
+- 文档分工见 [`README.md`](../README.md) 的"文档导航"一节

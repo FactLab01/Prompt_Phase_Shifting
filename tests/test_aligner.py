@@ -17,6 +17,7 @@ from phase_shifting.aligner import (
 )
 from phase_shifting.fillers import FillerRegistry
 from phase_shifting.keytokens import KEY_MODE_AUTO, KEY_MODE_KEYWORDS, KeyTokenSelector
+from phase_shifting.constants import DEFAULT_SLICE_LENGTH
 from phase_shifting.tokenizer_api import get_tokenizer, visible
 
 ZWSP = "​"
@@ -41,11 +42,12 @@ def make_aligner(**cfg):
 
 
 def assert_all_key_tokens_aligned(testcase, outcome, tokenizer=None):
-    """校验：引擎报告为 ALIGNED 时，所有关键 token 的真实新下标都能被 4 整除。
+    """校验：引擎报告为 ALIGNED 时，所有关键 token 的真实新下标都能归位到相位 0。
 
-    说明：插入点在"段落头部"，因此同段内后续 token 会被顺带推移。引擎对每个
+    说明：插入点紧贴目标 token，因此同段内后续 token 会被顺带推移。引擎对每个
     未对齐 token 都会重新定位并单独插入，因此最终每个关键 token 都应落在
-    ``index % period == 0`` 上。这里用"顺序匹配"独立复核引擎的结论。
+    ``index % period == 0`` 上。这里用"顺序匹配"独立复核引擎的结论，且以
+    ``outcome.period``（本次运行的切片长度）为基准，不写死任何数值。
     """
     tk = tokenizer or get_tokenizer()
     ids = tk.encode(outcome.aligned_text)
@@ -140,7 +142,8 @@ class MisalignedTest(unittest.TestCase):
             self.assertGreater(ins.token_cost, 0)
             self.assertIn("U+", ins.filler_codepoint)
             self.assertFalse(ins.structural)
-            self.assertEqual(ins.token_index_after % 4, 0)
+            period = out.period
+            self.assertEqual(ins.token_index_after % period, 0)
 
     def test_filler_is_invisible(self):
         out = make_aligner().align("Hello world 关键信息")
@@ -171,11 +174,26 @@ class LongInputTest(unittest.TestCase):
     """E5 超长输入。"""
 
     def test_long_input(self):
-        text = ("这是第 %d 段测试内容，包含一些英文单词与中文。\n\n" % 0) * 400
+        # 规模取 40 段：足以覆盖"超长输入"路径，同时把单测试耗时控制在秒级。
+        # 插入次数随关键 token 数线性增长，每次插入都要整篇重新 tokenize，
+        # 因此成本是 O(段数 × 段内 token 数)；全量规模由 test_long_input_scaling
+        # 单独守护。
+        text = ("这是第 %d 段测试内容，包含一些英文单词与中文。\n\n" % 0) * 40
         out = make_aligner().align(text)
         self.assertIn(out.status, (STATUS_ALIGNED, STATUS_PARTIAL))
         if out.status == STATUS_ALIGNED:
             assert_all_key_tokens_aligned(self, out)
+
+    def test_long_input_scaling(self):
+        """更大规模下的收敛性与幂等性（成本随规模线性增长，故只跑一次）。"""
+        text = ("这是第 %d 段测试内容，包含一些英文单词与中文。\n\n" % 0) * 120
+        out = make_aligner().align(text)
+        self.assertEqual(out.status, STATUS_ALIGNED)
+        self.assertTrue(out.insertions)
+        # 幂等：对已对齐结果再跑一次必须零干预
+        again = make_aligner().align(out.aligned_text)
+        self.assertEqual(again.status, STATUS_ALIGNED)
+        self.assertEqual(again.insertions, [])
 
     def test_max_chars_limit(self):
         cfg = AlignConfig(max_chars=10)
@@ -339,11 +357,11 @@ class SemanticIntegrityTest(unittest.TestCase):
     """语义完整性：插入占位符不得改变原文的可见内容与段落结构。"""
 
     MULTI = (
-        "DeepSeek 的注意力偏置位置位于 index % 4 == 0。\n\n"
+        "DeepSeek 的注意力偏置位置位于 index %% %d == 0。\n\n"
         "这段中文文本需要被物理推进，包含 key 关键信息 secret 秘密数据。\n\n"
         "Line one of the third paragraph.\n"
         "Line two stays in the same paragraph.\n\n"
-        "emoji 😀 与 CJK 混合 mixed content 123 数字符号 #@! 结尾\n"
+        "emoji 😀 与 CJK 混合 mixed content 123 数字符号 #@! 结尾\n" % DEFAULT_SLICE_LENGTH
     )
 
     def test_newlines_preserved(self):

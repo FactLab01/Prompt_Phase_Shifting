@@ -19,6 +19,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
+from .constants import DEFAULT_SLICE_LENGTH
 from .tokenizer_api import TokenizerHandle
 
 log = logging.getLogger("phase_shifting.validator")
@@ -39,7 +40,7 @@ class ValidationResult:
     reason: str = ""
     locate: Optional[LocateResult] = None
     new_index: Optional[int] = None
-    period: int = 4
+    period: int = DEFAULT_SLICE_LENGTH
     aligned: bool = False
     token_count_before: int = 0
     token_count_after: int = 0
@@ -48,13 +49,28 @@ class ValidationResult:
 
 
 class DynamicValidator:
-    """插入后的动态校验器。"""
+    """插入后的动态校验器。
 
-    def __init__(self, tokenizer: TokenizerHandle, period: int = 4) -> None:
+    Args:
+        tokenizer: tokenizer 封装。
+        period: 切片长度 / 相位周期，必须为正整数。默认取
+            :data:`phase_shifting.constants.DEFAULT_SLICE_LENGTH`。
+    """
+
+    def __init__(
+        self,
+        tokenizer: TokenizerHandle,
+        period: int = DEFAULT_SLICE_LENGTH,
+    ) -> None:
         if period <= 0:
-            raise ValueError("period 必须为正整数")
+            raise ValueError("period（切片长度）必须为正整数，收到 %r" % period)
         self.tokenizer = tokenizer
         self.period = period
+
+    @property
+    def slice_length(self) -> int:
+        """``period`` 的语义化别名：切片长度。"""
+        return self.period
 
     # ------------------------------------------------------------------ 定位
     def locate_anchor(
@@ -88,7 +104,7 @@ class DynamicValidator:
                 if stream[start : start + len(anchor)] == anchor:
                     candidates.append(start)
         if not candidates:
-            # 全流扫描兜底
+            # hint 窗口内未命中：全流扫描
             for start in range(0, len(stream) - len(anchor) + 1):
                 if stream[start : start + len(anchor)] == anchor:
                     candidates.append(start)

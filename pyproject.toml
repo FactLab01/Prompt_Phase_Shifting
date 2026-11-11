@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prompt-phase-shifting"
+version = "1.0.0"
+description = "把关键 token 物理推进到目标模型注意力偏置位置（index % slice_length == 0）的可配置 SDK"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Prompt Phase Shifting" }]
+keywords = [
+    "llm",
+    "tokenizer",
+    "prompt-engineering",
+    "phase-shifting",
+    "deepseek",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing",
+]
+# 唯一运行时依赖；版本下限取自本项目实测所用版本。
+dependencies = [
+    "deepseek-tokenizer>=0.3.0",
+]
+
+[project.optional-dependencies]
+# 测试用标准库 unittest；pytest 仅作为替代运行器可选安装。
+dev = [
+    "pytest>=7",
+]
+
+[project.scripts]
+phase-shifting = "phase_shifting.cli:main"
+
+[tool.setuptools]
+packages = ["phase_shifting"]
+
+[tool.setuptools.package-data]
+phase_shifting = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

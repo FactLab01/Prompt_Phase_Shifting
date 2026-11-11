@@ -7,6 +7,7 @@ import json
 import unittest
 
 from phase_shifting.aligner import STATUS_ALIGNED, STATUS_NO_KEY, AlignConfig, Aligner
+from phase_shifting.constants import DEFAULT_SLICE_LENGTH
 from phase_shifting.fillers import FillerRegistry
 from phase_shifting.keytokens import KEY_MODE_KEYWORDS, KeyTokenSelector
 from phase_shifting.report import render_index_table_only, render_json, render_text
@@ -59,7 +60,7 @@ class ReportTest(unittest.TestCase):
         out = self._align("Hello world 关键信息")
         payload = json.loads(render_json(out, self.tk))
         self.assertEqual(payload["status"], STATUS_ALIGNED)
-        self.assertEqual(payload["period"], 4)
+        self.assertEqual(payload["period"], DEFAULT_SLICE_LENGTH)
         self.assertTrue(payload["insertions"])
         for ins in payload["insertions"]:
             self.assertIn("filler_codepoint", ins)
