@@ -62,7 +62,6 @@ class ReadInputTest(unittest.TestCase):
             read_input(args)
 
     def test_empty_when_nothing(self):
-        # 无 stdin 数据时返回空
         args = build_parser().parse_args([])
         old = sys.stdin
         sys.stdin = io.StringIO("")
@@ -204,7 +203,6 @@ class CliIdempotencyTest(unittest.TestCase):
                 first = fh.read()
             with open(o2, "r", encoding="utf-8", newline="") as fh:
                 second = fh.read()
-            # 幂等：第二次运行结果与第一次完全一致
             self.assertEqual(first, second)
 
 

@@ -189,9 +189,8 @@ class KeyTokenSelector:
                 "window-size 仅在 key-mode=weight 下生效，当前 mode=%s" % mode,
                 {"key_mode": mode, "window_size": self.window_size},
             )
-        #: 判定结论缓存：``(mode, token_id, weight_threshold)`` → 结论元组。
-        #: 同一 token 的关键性与位置无关，可跨轮次/跨调用复用。
-        #: 注意：**窗口化判定与位置相关**，因此窗口化模式下不使用本缓存。
+        #: 判定结论缓存（``mode, token_id, weight_threshold`` → 结论）。
+        #: 关键性与位置无关故可复用；窗口化判定与位置相关，故该模式不使用本缓存。
         self._verdict_cache: Dict[tuple, tuple] = {}
 
     # ------------------------------------------------------------------ 判定

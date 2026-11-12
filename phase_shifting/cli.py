@@ -6,33 +6,15 @@
 翻译成 :class:`~phase_shifting.config.PhaseShiftConfig`，再把
 :class:`~phase_shifting.api.AlignmentResult` 渲染给人看。
 
-用法示例（以下均假设已在虚拟环境中激活，或已 ``pip install .``）::
+用法示例（假设已 ``pip install .``）::
 
-    # 1) 直接传文本
     python -m phase_shifting --text "Hello world 关键信息"
-
-    # 2) 从文件读
-    python -m phase_shifting --file input.txt
-
-    # 3) 从标准输入读（管道）
+    python -m phase_shifting --file input.txt --slice-length 4 --key-mode keywords
     echo "..." | python -m phase_shifting -
-
-    # 4) 指定模型切片长度 + 关键词模式 + 差异视图 + JSON
-    python -m phase_shifting --file input.txt \
-        --slice-length 4 --key-mode keywords --keywords 关键,secret --diff --json
-
-    # 5) 还原（幂等性兜底）
-    python -m phase_shifting --restore aligned.txt
+    python -m phase_shifting restore aligned.txt
 
 安装后也可直接用 ``phase-shifting`` 命令，与 ``python -m phase_shifting`` 等价。
-子命令形式同样可用：``python -m phase_shifting restore aligned.txt``。
-
-若需要以编程方式调用（无命令行），请直接使用 SDK::
-
-    from phase_shifting import align_text
-
-    result = align_text("Hello world 关键信息", slice_length=4)
-    print(result.aligned_text, result.summary())
+若需要以编程方式调用，请直接使用 SDK :func:`phase_shifting.align_text`。
 """
 
 from __future__ import annotations
@@ -98,7 +80,6 @@ def read_input(args: argparse.Namespace) -> Tuple[str, str]:
     if positional:
         return positional[0] if isinstance(positional, list) else positional, "cli-positional"
 
-    # stdin
     if not sys.stdin.isatty():
         data = sys.stdin.read()
         if data:
@@ -309,7 +290,6 @@ def run(args: argparse.Namespace) -> int:
         logger.error("%s: %s", exc.code, exc)
         return EXIT_FAILED
 
-    # 适配为报告层期望的结果对象
     outcome = _to_outcome(result, tokenizer)
 
     # ------------------------------------------------------------------ 输出
@@ -369,9 +349,7 @@ def _to_outcome(result: "AlignmentResult", tokenizer: TokenizerHandle):
             )
         )
 
-    # SDK 的插入明细以 JSON 友好键命名（"filler" / "structural_interference"），
-    # 报告层沿用引擎字段名（"filler_name" / "structural"）；此处做一次键名映射，
-    # 避免报告层感知两种命名。
+    # SDK 的插入明细用 JSON 友好键，报告层用引擎字段名，此处做一次键名映射。
     _KEY_ALIASES = {
         "filler_name": "filler",
         "structural": "structural_interference",

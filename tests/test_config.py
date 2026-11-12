@@ -65,7 +65,6 @@ class SliceLengthParameterizationTest(unittest.TestCase):
         derived = base.with_slice_length(16)
         self.assertEqual(derived.slice_length, 16)
         self.assertEqual(derived.key_mode, "keywords")
-        # 原对象不被修改
         self.assertEqual(base.slice_length, 4)
 
     def test_invalid_slice_lengths_rejected(self):

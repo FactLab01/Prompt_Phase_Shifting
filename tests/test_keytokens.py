@@ -112,7 +112,6 @@ class KeyTokenSelectorTest(unittest.TestCase):
     def test_auto_mode(self):
         rep = self._select(mode=KEY_MODE_AUTO)
         self.assertTrue(rep.key_indices)
-        # 纯标点 token 不应该是关键 token
         for d in rep.decisions:
             if d.text in (".", "...", ""):
                 self.assertFalse(d.is_key, d.text)

@@ -210,8 +210,7 @@ def token_start_offsets(
     else:
         log.debug("token 字节流与文本不匹配：%d vs %d 字节", len(raw), len(tb))
         return None
-    # byte_to_char_map 是 O(文本字节数) 的；只需前缀偏移时，只建到目标字节处，
-    # 把长文本上的反复调用从 O(全文) 降到 O(前缀)。
+    # byte_to_char_map 为 O(文本字节数)，只需前缀偏移时限量建表
     table = byte_to_char_map(text, max_bytes=len(raw) + abs(shift) + 1)
     offsets: List[int] = []
     pos = 0

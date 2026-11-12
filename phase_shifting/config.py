@@ -229,7 +229,6 @@ class PhaseShiftConfig:
         )
 
 
-# 便于按需引用的模块级默认实例工厂
 def default_config(**overrides: Any) -> PhaseShiftConfig:
     """构造默认配置，可用关键字参数覆盖任意字段。"""
     return PhaseShiftConfig(**overrides)

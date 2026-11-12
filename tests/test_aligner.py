@@ -147,7 +147,6 @@ class MisalignedTest(unittest.TestCase):
 
     def test_filler_is_invisible(self):
         out = make_aligner().align("Hello world 关键信息")
-        # 还原后应与原文一致（说明插入的都是不可见字符）
         restored, removed = make_aligner().restore(out.aligned_text)
         self.assertGreater(removed, 0)
         self.assertEqual(restored, out.original_text)
@@ -174,10 +173,8 @@ class LongInputTest(unittest.TestCase):
     """E5 超长输入。"""
 
     def test_long_input(self):
-        # 规模取 40 段：足以覆盖"超长输入"路径，同时把单测试耗时控制在秒级。
-        # 插入次数随关键 token 数线性增长，每次插入都要整篇重新 tokenize，
-        # 因此成本是 O(段数 × 段内 token 数)；全量规模由 test_long_input_scaling
-        # 单独守护。
+        # 规模取 40 段：覆盖"超长输入"路径并把耗时控制在秒级；
+        # 更大规模由 test_long_input_scaling 单独守护。
         text = ("这是第 %d 段测试内容，包含一些英文单词与中文。\n\n" % 0) * 40
         out = make_aligner().align(text)
         self.assertIn(out.status, (STATUS_ALIGNED, STATUS_PARTIAL))
@@ -190,7 +187,6 @@ class LongInputTest(unittest.TestCase):
         out = make_aligner().align(text)
         self.assertEqual(out.status, STATUS_ALIGNED)
         self.assertTrue(out.insertions)
-        # 幂等：对已对齐结果再跑一次必须零干预
         again = make_aligner().align(out.aligned_text)
         self.assertEqual(again.status, STATUS_ALIGNED)
         self.assertEqual(again.insertions, [])
@@ -232,10 +228,8 @@ class IdempotencyTest(unittest.TestCase):
         text = "Hello world 关键信息"
         al = make_aligner()
         out1 = al.align(text)
-        # 关闭还原再跑一次：结果应与开启还原时一致（因为默认会还原）
         al2 = make_aligner(restore_first=False)
         out2 = al2.align(out1.aligned_text)
-        # 不还原时会叠加，但必须仍然 ALIGNED
         self.assertEqual(out2.status, STATUS_ALIGNED)
 
     def test_restore_roundtrip(self):

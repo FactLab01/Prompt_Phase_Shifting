@@ -112,7 +112,6 @@ class DynamicValidator:
         if not candidates:
             return LocateResult(False, None, hint, 0, "锚点在插入后的 token 流中丢失")
 
-        # 取离 hint 最近的那个
         if hint is None:
             best = candidates[0]
         else:

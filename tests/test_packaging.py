@@ -287,9 +287,7 @@ class SourceHygieneTest(unittest.TestCase):
         for path in _iter_source_files():
             source = path.read_text(encoding="utf-8")
             self.assertNotRegex(source, r"rm\s+-rf", source)
-            # pip install 只允许出现在两类文案里：
-            #   1) 运行时依赖缺失的安装指引；
-            #   2) 安装本项目自身的示例（pip install . / pip install -e .）。
+            # pip install 只允许出现在：依赖缺失的安装指引，或安装本项目自身的示例中。
             for match in re.finditer(r"pip install", source):
                 line_start = source.rfind("\n", 0, match.start()) + 1
                 line_end = source.find("\n", match.start())

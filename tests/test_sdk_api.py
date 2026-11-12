@@ -123,7 +123,6 @@ class PhaseShifterObjectTest(unittest.TestCase):
         seen = []
         shifter = PhaseShifter()
         shifter.align("Hello world 关键信息", progress=seen.append)
-        # 已天然对齐的短文本可能零干预；只要回调签名可用且未抛错即可
         self.assertIsInstance(seen, list)
 
     def test_invalid_config_rejected(self):
@@ -221,7 +220,6 @@ class SerializationTest(unittest.TestCase):
         self.assertEqual(payload["status"], result.status)
 
     def test_from_outcome_adapter(self):
-        # 适配器必须能把引擎内部结果无损转成公共结果对象
         from phase_shifting.aligner import AlignOutcome
 
         outcome = AlignOutcome(

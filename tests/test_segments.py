@@ -54,7 +54,6 @@ class InsertOffsetTest(unittest.TestCase):
     def test_leading_newline_skipped(self):
         text = "\n\n正文内容"
         segs = split_segments(text)
-        # "\n\n" 是段落分隔，因此分成 2 段："" 和 "正文内容"
         self.assertEqual(len(segs), 2)
         offset = segs[1].insert_offset()
         self.assertEqual(text[offset:], "正文内容")
@@ -63,7 +62,6 @@ class InsertOffsetTest(unittest.TestCase):
         text = "标题\n正文内容"
         segs = split_segments(text)
         self.assertEqual(len(segs), 1)
-        # 单个 \n 不是分隔符，插入点落在段首（"标"之前）
         self.assertEqual(segs[0].insert_offset(), 0)
 
     def test_leading_spaces_skipped(self):
@@ -149,7 +147,6 @@ class TokenOffsetsTest(unittest.TestCase):
             self.assertIsNotNone(offs, text)
             for off in offs:
                 self.assertTrue(0 <= off <= len(text), text)
-                # 从 off 处切分后再拼接，必须无损还原
                 self.assertEqual(text[:off] + text[off:], text, text)
 
     def test_token_start_offsets_empty(self):
@@ -161,7 +158,6 @@ class TokenOffsetsTest(unittest.TestCase):
         from phase_shifting.segments import token_bytes
 
         self.assertEqual(token_bytes("alpha"), b"alpha")
-        # ByteLevel 的 Ġ 在源码里是一个独立字符，等价于 ASCII 空格
         self.assertEqual(token_bytes("Ġbeta"), b" beta")
         # ZWSP 的 ByteLevel 串 → UTF-8 字节 E2 80 8B
         self.assertEqual(len(token_bytes("​")), 3)

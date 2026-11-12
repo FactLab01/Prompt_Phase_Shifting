@@ -8,30 +8,25 @@
 
 from __future__ import annotations
 
-#: 默认切片长度。
-#:
-#: 这是本包中唯一允许出现该数字字面量的位置；其余模块一律引用本常量或
-#: 由调用方显式传入的 ``slice_length`` 参数。
+#: 默认切片长度；本包中唯一允许出现该字面量的位置。
 DEFAULT_SLICE_LENGTH: int = 4
 
-#: 默认关键 token 判定模式（``auto`` / ``keywords`` / ``weight``）。
+#: 默认关键 token 判定模式。
 DEFAULT_KEY_MODE: str = "auto"
 
-#: 默认宏观窗口长度（token 数），0 表示关闭窗口化判定。
-#:
-#: 窗口长度建议取目标模型步长（stride）的整数倍，常见为 64 / 128 token。
+#: 默认宏观窗口长度（token 数），0 表示关闭；建议取模型步长的整数倍。
 DEFAULT_WINDOW_SIZE: int = 0
 
-#: 默认窗口聚合方式（``sum`` = 窗口内权重总和，``count`` = 高分词个数）。
+#: 默认窗口聚合方式。
 DEFAULT_WINDOW_AGG: str = "sum"
 
-#: 默认插入位置策略（``inline`` = 紧贴目标 token，``segment`` = 段落头部）。
+#: 默认插入位置策略。
 DEFAULT_INSERT_MODE: str = "inline"
 
 #: 单个 token 的最大候选尝试预算。
 DEFAULT_MAX_RETRIES: int = 6
 
-#: 输入字符数上限保护。
+#: 输入字符数上限。
 DEFAULT_MAX_CHARS: int = 200_000
 
 #: 默认语义权重阈值。

@@ -239,7 +239,6 @@ class WindowedAlignIntegrationTest(unittest.TestCase):
         self.assertEqual(plan.peak_window["size"], 16)
         self.assertIn("start", plan.peak_window)
         self.assertIn("score", plan.peak_window)
-        # 序列化必须可 JSON 化
         import json
 
         json.dumps(plan.to_dict(), ensure_ascii=False)

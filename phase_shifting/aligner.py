@@ -1,29 +1,10 @@
 # -*- coding: utf-8 -*-
 """对齐引擎：最小干预地把关键 token 推进到目标相位。
 
-算法（对应 ``docs/SPEC.md`` 第 7 节流程图）::
+算法流程见 ``docs/SPEC.md`` §7。核心是不变量：插入点只允许落在目标 token 正前方，
+并以"前缀零破坏"作为硬性验收条件，使已对齐 token 的相位永不受扰动，迭代必然收敛。
 
-    for each 未对齐关键 token t (每轮重新 tokenize，按下标升序取第一个):
-        delta = (period - t.index % period) % period        # 需要推进的位数
-        base  = token_start_offsets(working)[t.index]       # t 的字符偏移
-        在 base±0/1/2 处尝试插入 delta / delta+1 / delta+2 个占位字符
-        → 立即重新 tokenize 全文，做**双条件校验**：
-             A. ids2[:t.index] == ids[:t.index]             （前缀零破坏）
-             B. 目标 id 首次出现位置 j >= t.index 且 j % period == 0
-        → 成功：记录插入明细，进入下一轮
-        → 失败：换插入点 / 换数量 / 换占位种类，重试 ≤ max_retries
-
-设计约束（插入点必须紧贴目标 token）：
-  插入点只允许落在目标 token 的正前方，并以"前缀零破坏"作为硬性验收条件，
-  使已对齐 token 的相位永不受扰动，迭代因此必然收敛。
-
-关键点：
-
-* 插入点由 ``segments.token_start_offsets`` 通过 ByteLevel 字节累加精确推导，
-  天然落在 token 的前导空格之前，``Ġ`` 前缀形态得以保留；
-* 不预测量是否精确等于 delta，而是**插入后实测**，因此 BPE 合并/拆分
-  导致的数量偏差由 ``delta±1/delta±2`` 补偿候选自动吸收；
-* 幂等性：引擎提供 ``restore``，可一键剥离全部占位字符。
+插入数量取实测值而非预测值：BPE 合并/拆分导致的偏差由数量补偿候选自动吸收。
 """
 
 from __future__ import annotations
@@ -60,15 +41,14 @@ INSERT_MODES = (INSERT_MODE_SEGMENT, INSERT_MODE_INLINE)
 _OFFSET_CANDIDATES = (0, -1, 1, -2, 2, -3, 3)
 #: 占位字符数量的候选偏移（相对理论 delta）
 _COUNT_CANDIDATES = (0, 1, 2, -1)
-#: 单次插入的字符数上限基数；实际上限为 ``max(_CHAR_CAP_BASE, delta + 2)``，
-#: 从而在大切片长度（delta 很大）时仍留有补偿余地。
+#: 字符数上限基数；实际上限为 max(_CHAR_CAP_BASE, delta + 2)，为大切片长度留补偿余地
 _CHAR_CAP_BASE = 8
-#: 主循环轮数上限的乘数因子与保底值（防御性护栏，与切片长度无关）。
+#: 主循环轮数上限 = 决策数 × _ROUND_FACTOR，下限 _ROUND_FLOOR（防御性护栏）
 _ROUND_FACTOR = 4
 _ROUND_FLOOR = 16
-#: 插入后重新定位锚点时的搜索容差基数。
+#: 插入后重新定位锚点的搜索容差基数
 _LOCATE_TOLERANCE_BASE = 4
-#: 单个 token 的候选尝试预算系数（相对 ``max_retries``）。
+#: 单 token 候选尝试预算系数（相对 max_retries）
 _ATTEMPT_BUDGET_FACTOR = 12
 
 STATUS_ALIGNED = "ALIGNED"
@@ -229,15 +209,14 @@ class Aligner:
         self.tokenizer = tokenizer
         self.selector = selector
         self.registry = registry
-        # 如果 selector 没拿到 tokenizer / filler_chars，这里补上，
-        # 保证 filler token 永远不会被误判为关键 token。
+        # selector 未注入 tokenizer / filler_chars 时补齐，确保 filler token
+        # 不会被误判为关键 token
         if selector.tokenizer is None:
             selector.tokenizer = tokenizer
         if not selector.filler_chars:
             selector.filler_chars = {registry.get(n).char for n in registry.names()}
-        # 可安全剥离的占位字符：只有"不可见且无结构干扰"的候选才允许参与
-        # 幂等还原。结构型候选（lf 换行）一旦参与剥离，就会把原文里合法的
-        # 换行一起删掉，造成不可逆的语义破坏。
+        # 仅"不可见且无结构干扰"的候选可参与还原：lf 的换行与原文合法换行
+        # 无法区分，纳入剥离会造成不可逆的段落破坏
         self._strippable = {
             registry.get(n).char
             for n in registry.names()
@@ -262,11 +241,8 @@ class Aligner:
                 {"length": len(text), "max_chars": self.config.max_chars},
             )
 
-        # 幂等策略分两步：
-        #   1) 先对**原始输入**（含历史占位符）编码并判定；
-        #      已全部对齐 → 零干预返回，不剥离、不重算；
-        #   2) 仍有未对齐项 → 剥离历史占位符后从原文重新计算，
-        #      保证"同一份原文永远得到同一份结果"。
+        # 幂等策略：先对原始输入（含历史占位符）判定，已全部对齐即零干预返回；
+        # 仍有未对齐项时剥离历史占位符后重算，保证同一份原文得到同一份结果。
         encoded_before: Encoded = self.tokenizer.encode_with_tokens(text)
         report = self.selector.select(
             encoded_before.tokens, encoded_before.ids, self.tokenizer.vocab_size
@@ -274,7 +250,7 @@ class Aligner:
 
         if not report.key_indices:
             log.info("未识别到关键 token（mode=%s）", self.selector.mode)
-            # 空文本 / 纯空白：没有任何关键 token，天然就是"已对齐"（零干预）
+            # 空文本 / 纯空白没有任何关键 token，天然"已对齐"（零干预）
             if not encoded_before.ids or not text.strip():
                 return AlignOutcome(
                     status=STATUS_ALIGNED,
@@ -297,7 +273,7 @@ class Aligner:
                 message="选择器 %s 未命中任何 token" % self.selector.describe(),
             )
 
-        # 需要处理的目标 token（按下标升序）
+        # 待处理目标 token（按下标升序）
         misaligned = [
             d for d in report.decisions if d.needs_align(self.config.period)
         ]
@@ -313,8 +289,7 @@ class Aligner:
                 key_report=report,
             )
 
-        # 仍有未对齐项：剥离历史占位字符，从"干净原文"重新计算，
-        # 保证同一份原文永远得到同一份结果。
+        # 仍有未对齐项：剥离历史占位符后从干净原文重算
         if self.config.restore_first:
             text, removed = self._restore(text)
             if removed:
@@ -330,10 +305,8 @@ class Aligner:
         failures: List[Dict[str, object]] = []
         validations: List[ValidationResult] = []
 
-        # 迭代式主循环：每轮重新 tokenize，取"当前"第一个未对齐的关键 token。
-        # 插入点紧贴该 token，且要求插入后前缀 token 零破坏，因此已对齐的
-        # token 相位永不被扰动 —— 循环必然收敛（每轮至少消灭一个未对齐 token）。
-        # 上界取 _ROUND_FACTOR 倍决策数 + _ROUND_FLOOR，纯粹是防御性护栏。
+        # 每轮重新 tokenize，取当前第一个未对齐的关键 token；插入点紧贴该 token
+        # 且满足前缀零破坏，故每轮至少消灭一个未对齐项，循环必然收敛。
         max_rounds = max(len(report.decisions) * _ROUND_FACTOR, _ROUND_FLOOR)
         seen_states: set = set()
         for round_no in range(max_rounds):
@@ -353,8 +326,7 @@ class Aligner:
             delta = decision.delta_needed(self.config.period)
             anchor = enc_now.ids[target_before : target_before + 1]
 
-            # 段落映射与字符偏移都是 O(文本长度) 的全量计算，而每轮只需要目标
-            # token 附近的信息；因此仅在非 inline 模式下才计算段落映射。
+            # 段落映射是 O(文本长度) 的全量计算，仅非 inline 模式需要
             seg = None
             if self.config.insert_mode != INSERT_MODE_INLINE:
                 segments = split_segments(working)
@@ -365,7 +337,7 @@ class Aligner:
                     else None
                 )
 
-            # 只需要目标 token 的字符偏移，因此把计算限制在前缀范围内
+            # 只需目标 token 的字符偏移，计算限制在前缀范围内
             offsets_now = token_start_offsets(
                 working, enc_now.tokens, limit=target_before + 1
             )
@@ -480,15 +452,14 @@ class Aligner:
         seg_index = segment.index if segment is not None else -1
 
         if base_offset is None:
-            # byte-level 定位失败（理论上不会）：退化为按 token 文本查找
+            # byte-level 定位失败时按 token 文本查找
             base_offset = self._token_char_offset(working, decision)
 
         attempts = 0
         max_attempts = max(1, self.config.max_retries)
         budget = max_attempts * _ATTEMPT_BUDGET_FACTOR
-        # 枚举顺序：插入点优先（off_delta=0 最常见），其次字符数补偿，最后占位种类。
-        # 每次验证都要整篇重新 tokenize，因此让最可能成功的组合排在最前面，
-        # 减少无效候选的全量编码次数。
+        # 枚举顺序：插入点 → 字符数补偿 → 占位种类；每次验证都要整篇重新
+        # tokenize，故把最可能成功的组合排在前面以减少无效全量编码。
         for off_delta in _OFFSET_CANDIDATES:
             offset = base_offset + off_delta
             if offset < 0 or offset > len(working):

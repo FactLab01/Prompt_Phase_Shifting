@@ -30,7 +30,6 @@ from __future__ import annotations
 
 __version__ = "1.0.0"
 
-# ------------------------------------------------------------------ 常量
 from .constants import (
     DEFAULT_INSERT_MODE,
     DEFAULT_KEY_MODE,
@@ -40,7 +39,6 @@ from .constants import (
     DEFAULT_WEIGHT_THRESHOLD,
 )
 
-# ------------------------------------------------------------------ 异常
 from .errors import (
     AlignmentError,
     AnchorLostError,
@@ -52,10 +50,8 @@ from .errors import (
     UnknownFillerError,
 )
 
-# ------------------------------------------------------------------ 配置
 from .config import PhaseShiftConfig, default_config
 
-# ------------------------------------------------------------------ SDK 门面
 from .api import (
     AlignmentPlan,
     AlignmentResult,
@@ -65,19 +61,16 @@ from .api import (
     restore_text,
 )
 
-# ------------------------------------------------------------------ 原语层
 from .primitives import PRIMITIVE_SIGNATURES
 
 __all__ = [
     "__version__",
-    # 常量
     "DEFAULT_SLICE_LENGTH",
     "DEFAULT_KEY_MODE",
     "DEFAULT_INSERT_MODE",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_MAX_CHARS",
     "DEFAULT_WEIGHT_THRESHOLD",
-    # 异常
     "PhaseShiftingError",
     "ConfigurationError",
     "UnknownFillerError",
@@ -86,16 +79,13 @@ __all__ = [
     "AlignmentError",
     "AnchorLostError",
     "RetryExhaustedError",
-    # 配置
     "PhaseShiftConfig",
     "default_config",
-    # SDK 门面
     "PhaseShifter",
     "AlignmentResult",
     "AlignmentPlan",
     "align_text",
     "plan_text",
     "restore_text",
-    # 原语层
     "PRIMITIVE_SIGNATURES",
 ]

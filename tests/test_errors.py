@@ -108,7 +108,6 @@ class MessageAndDetailsTest(unittest.TestCase):
         self.assertIn("zwsp", text)
         self.assertIn("bom", text)
         self.assertIn("mix", text)
-        # 不应被 KeyError 的 repr 引号包裹
         self.assertFalse(text.startswith("'") or text.startswith('"'))
 
     def test_unknown_filler_details(self):

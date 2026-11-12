@@ -75,7 +75,6 @@ class TokenizerApiTest(unittest.TestCase):
 
     def test_locate_index_missing_token(self):
         text = "alpha beta"
-        # 用一个不存在于文本中的 id：退化为 hint
         self.assertEqual(self.tk.locate_index_nth(text, 1, 0, hint=7), 7)
 
     def test_visible_and_codepoint(self):
